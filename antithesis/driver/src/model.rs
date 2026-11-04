@@ -18,6 +18,9 @@ pub const ORDER_GRACE: Duration = Duration::from_secs(20);
 pub const SESSION_LOSS_GRACE: Duration = Duration::from_secs(30);
 /// Records older than this are forgotten.
 pub const RETENTION: Duration = Duration::from_secs(12 * 60);
+/// Ended subscriptions and connections are kept this long (deliveries can trail them by a
+/// few seconds at most).
+pub const EPOCH_RETENTION: Duration = Duration::from_secs(120);
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct ConnKey {
@@ -157,6 +160,8 @@ pub struct Stats {
     pub log_lines: u64,
     pub pruned_msgs: u64,
     pub packets: u64,
+    pub packets_received: u64,
+    pub busy: u64,
 }
 
 pub struct Model {
@@ -317,6 +322,30 @@ impl Model {
 
     pub fn issue_disconnect(&mut self, op: u64, client: usize) {
         self.ops.insert(op, OpMeta { client, kind: OpKind::Disconnect, issued: Instant::now(), qos: 0 });
+    }
+
+    /// Forgets an op the client program rejected before doing anything with it.
+    pub fn retract(&mut self, op: u64) {
+        let Some(meta) = self.ops.remove(&op) else { return };
+        match meta.kind {
+            OpKind::Publish => {
+                if let Some(m) = self.msgs.remove(&op) {
+                    if let Some(h) = self.retained_hist.get_mut(&m.topic) {
+                        h.retain(|o| *o != op);
+                    }
+                }
+            }
+            OpKind::Subscribe => self.clients[meta.client].epochs.retain(|e| e.sub_op != op),
+            OpKind::Unsubscribe => {
+                for e in self.clients[meta.client].epochs.iter_mut() {
+                    if e.unsub_op == Some(op) {
+                        e.unsub_op = None;
+                        e.unsub_sent = None;
+                    }
+                }
+            }
+            OpKind::Disconnect => {}
+        }
     }
 
     /// Filters the client has confirmed, in its current session, and hasn't unsubscribed.
@@ -601,7 +630,13 @@ impl Model {
                 if outcome == "suback" {
                     let name = self.clients[idx].name.clone();
                     let c = &mut self.clients[idx];
+                    // A SUBSCRIBE queued at the client across a reconnect takes effect on the
+                    // connection that acknowledged it, so that connection's session owns it.
+                    let ack_session = c.conns.get(&key).map(|r| r.session);
                     let Some(e) = c.epochs.iter_mut().find(|e| e.sub_op == op) else { return };
+                    if let Some(s) = ack_session {
+                        e.session = s;
+                    }
                     assert_always!(codes.len() == 1, "a SUBACK carries one return code per requested filter (MQTT-3.8.4-5)", &json!({"client": name, "filter": e.filter, "codes": codes}));
                     let code = codes.first().copied().unwrap_or(128);
                     if code >= 128 {
@@ -718,9 +753,14 @@ impl Model {
                 if retain {
                     assert_always!(m_retain && !m_empty, "a message delivered with the retain flag was published as a retained message (MQTT-3.3.1-8/9)", &json!({"subscriber": name, "topic": topic, "op": op}));
                     let plausible = matching.iter().any(|&i| self.retained_plausible(op, idx, i));
-                    assert_always!(plausible, "a retained message delivered to a new subscription is the topic's latest retained message (MQTT-3.3.1-6)",
-                        &json!({"subscriber": name, "topic": topic, "op": op, "sent_ms": self.ms(m_sent), "acked_ms": self.ms_opt(m_acked),
-                                "history": self.retained_hist.get(&topic).map(|h| h.iter().rev().take(5).map(|o| self.describe_msg(*o)).collect::<Vec<_>>())}));
+                    if plausible {
+                        assert_always!(true, "a retained message delivered to a new subscription is the topic's latest retained message (MQTT-3.3.1-6)", &json!({}));
+                    } else {
+                        assert_always!(false, "a retained message delivered to a new subscription is the topic's latest retained message (MQTT-3.3.1-6)",
+                            &json!({"subscriber": name, "topic": topic, "op": op, "sent_ms": self.ms(m_sent), "settled_ms": self.ms_opt(m_acked), "session": session,
+                                    "epochs": self.describe_epochs(idx, session),
+                                    "history": self.retained_hist.get(&topic).map(|h| h.iter().rev().take(5).map(|o| self.describe_msg(*o)).collect::<Vec<_>>())}));
+                    }
                     self.msgs.get_mut(&op).unwrap().retained_deliveries.insert((idx, session));
                     if self.active {
                         assert_sometimes!(true, "a retained message is delivered to a new subscription (MQTT-3.3.1-6)", &json!({"topic": topic}));
@@ -737,14 +777,18 @@ impl Model {
                     })
                     .collect();
                 let eligible = !eligible_epochs.is_empty();
-                assert_always!(eligible, "a message is delivered only to a matching subscription that was live when it was published (MQTT-3.3.2-3, MQTT-3.10.4-2)",
-                    &json!({"subscriber": name, "topic": topic, "op": op, "publisher": pub_name, "sent_ms": self.ms(m_sent), "acked_ms": self.ms_opt(m_acked),
-                            "session": session, "epochs": self.describe_epochs(idx, session)}));
+                if eligible {
+                    assert_always!(true, "a message is delivered only to a matching subscription that was live when it was published (MQTT-3.3.2-3, MQTT-3.10.4-2)", &json!({}));
+                } else {
+                    assert_always!(false, "a message is delivered only to a matching subscription that was live when it was published (MQTT-3.3.2-3, MQTT-3.10.4-2)",
+                        &json!({"subscriber": name, "topic": topic, "op": op, "publisher": pub_name, "sent_ms": self.ms(m_sent), "settled_ms": self.ms_opt(m_acked),
+                                "session": session, "epochs": self.describe_epochs(idx, session)}));
+                }
 
                 let pkid = v["pkid"].as_u64().unwrap_or(0) as u16;
                 let dup = v["dup"].as_bool().unwrap_or(false);
                 let now_ms = self.ms(now);
-                let (count, recent) = {
+                let count = {
                     let m = self.msgs.get_mut(&op).unwrap();
                     let c = m.deliveries.entry((idx, session)).or_insert(0);
                     *c += 1;
@@ -752,9 +796,8 @@ impl Model {
                         m.recent.remove(0);
                     }
                     m.recent.push((idx, key.conn, pkid, dup, now_ms));
-                    (*c, m.recent.clone())
+                    *c
                 };
-                let recent: Vec<Value> = recent.iter().map(|(s, c, p, d, t)| json!({"subscriber": self.clients[*s].name, "conn": c, "pkid": p, "dup": d, "ms": t})).collect();
                 // The QoS and copy bounds come from the subscriptions this delivery can belong to.
                 let max_granted = eligible_epochs
                     .iter()
@@ -770,18 +813,43 @@ impl Model {
                     None => m_qos,
                 };
                 if let Some(mg) = max_granted {
-                    assert_always!(qos <= mg, "a forwarded message's QoS never exceeds the subscription's granted QoS (MQTT-3.8.4-6)",
-                        &json!({"subscriber": name, "topic": topic, "op": op, "qos": qos, "granted": mg, "epochs": self.describe_epochs(idx, session)}));
+                    if qos <= mg {
+                        assert_always!(true, "a forwarded message's QoS never exceeds the subscription's granted QoS (MQTT-3.8.4-6)", &json!({}));
+                    } else {
+                        assert_always!(false, "a forwarded message's QoS never exceeds the subscription's granted QoS (MQTT-3.8.4-6)",
+                            &json!({"subscriber": name, "topic": topic, "op": op, "qos": qos, "granted": mg, "epochs": self.describe_epochs(idx, session)}));
+                    }
                 }
                 if self.strict_qos {
                     assert_always!(qos <= m_qos, "a forwarded message's QoS never exceeds the QoS it was published with (MQTT-3.8.4-6)",
                         &json!({"subscriber": name, "topic": topic, "op": op, "published_qos": m_qos, "delivered_qos": qos}));
                 }
+                let recent_details = |me: &Model| -> Vec<Value> {
+                    me.msgs[&op].recent.iter().map(|(s, c, p, d, t)| json!({"subscriber": me.clients[*s].name, "conn": c, "pkid": p, "dup": d, "ms": t})).collect()
+                };
                 match eff {
-                    2 => assert_always!(count <= copies, "a QoS 2 message is delivered exactly once per matching subscription (MQTT-4.3.3)",
-                        &json!({"subscriber": name, "topic": topic, "op": op, "publisher": pub_name, "count": count, "allowed": copies, "session": session, "recent": recent, "epochs": self.describe_epochs(idx, session)})),
-                    0 => assert_always!(count <= copies, "a QoS 0 message is delivered at most once per matching subscription (MQTT-4.3.1)",
-                        &json!({"subscriber": name, "topic": topic, "op": op, "publisher": pub_name, "count": count, "allowed": copies, "session": session, "recent": recent, "epochs": self.describe_epochs(idx, session)})),
+                    2 => {
+                        if count <= copies {
+                            assert_always!(true, "a QoS 2 message is delivered exactly once per matching subscription (MQTT-4.3.3)", &json!({}));
+                        } else {
+                            assert_always!(false, "a QoS 2 message is delivered exactly once per matching subscription (MQTT-4.3.3)",
+                                &json!({"subscriber": name, "topic": topic, "op": op, "publisher": pub_name, "count": count, "allowed": copies,
+                                    "session": session, "published_qos": m_qos, "recent": recent_details(self), "epochs": self.describe_epochs(idx, session)}));
+                        }
+                    }
+                    0 => {
+                        if count <= copies {
+                            assert_always!(true, "a QoS 0 message is delivered at most once per matching subscription (MQTT-4.3.1)", &json!({}));
+                        } else {
+                            assert_always!(false, "a QoS 0 message is delivered at most once per matching subscription (MQTT-4.3.1)",
+                                &json!({"subscriber": name, "topic": topic, "op": op, "publisher": pub_name, "count": count, "allowed": copies,
+                                    "session": session, "published_qos": m_qos, "recent": recent_details(self), "epochs": self.describe_epochs(idx, session)}));
+                        }
+                    }
+                    _ => {}
+                }
+                match eff {
+                    2 | 0 => {}
                     _ => {
                         if self.active {
                             assert_sometimes!(count > copies, "a QoS 1 message is delivered more than once to the same subscriber", &json!({"topic": topic, "op": op, "count": count}));
@@ -848,11 +916,11 @@ impl Model {
     }
 
     fn retained_plausible(&self, op: u64, idx: usize, epoch: usize) -> bool {
+        // rumqttd reads the retained messages when the subscription is first consumed, which
+        // can be after the SUBACK, so the only sound bound is "not superseded by a retained
+        // publish the broker had stored before the SUBSCRIBE was sent".
         let e = &self.clients[idx].epochs[epoch];
         let m = &self.msgs[&op];
-        if !lt(m.sent, e.confirmed) {
-            return false;
-        }
         let Some(msettled) = m.settled() else { return true };
         let Some(hist) = self.retained_hist.get(&m.topic) else { return true };
         !hist.iter().any(|&o2| {
@@ -974,7 +1042,7 @@ impl Model {
                 assert_sometimes!(true, "a persistent session is lost because the broker restarted", &json!({"client": self.clients[idx].name}));
             }
         }
-        if now.duration_since(self.last_prune) > Duration::from_secs(60) {
+        if now.duration_since(self.last_prune) > Duration::from_secs(30) {
             self.last_prune = now;
             self.prune(now);
         }
@@ -1001,8 +1069,8 @@ impl Model {
             }
         }
         for c in self.clients.iter_mut() {
-            c.conns.retain(|_, r| r.ended.map_or(true, |e| now.duration_since(e) < RETENTION));
-            c.epochs.retain(|e| e.ended.map_or(true, |t| now.duration_since(t) < RETENTION));
+            c.conns.retain(|_, r| r.ended.map_or(true, |e| now.duration_since(e) < EPOCH_RETENTION));
+            c.epochs.retain(|e| e.ended.map_or(true, |t| now.duration_since(t) < EPOCH_RETENTION));
             c.will_seen.retain(|_, t| now.duration_since(*t) < RETENTION);
         }
         let ended: HashSet<ConnKey> = self
@@ -1018,6 +1086,7 @@ impl Model {
         json!({
             "events": self.stats.events,
             "packets": self.stats.packets,
+            "packets_received": self.stats.packets_received,
             "bad_events": self.stats.bad_events,
             "dup_events": self.stats.dup_events,
             "deliveries": self.stats.deliveries,
@@ -1026,6 +1095,7 @@ impl Model {
             "synthesized_conns": self.stats.synthesized_conns,
             "order_unplaceable": self.stats.order_unplaceable,
             "http_failures": self.stats.http_failures,
+            "busy": self.stats.busy,
             "clients": self.clients.iter().map(|c| json!({"name": c.name, "connected": c.connected, "conn": c.conn, "session": c.session, "disconnects": c.disconnects, "live_filters": self.live_filters_of(c)})).collect::<Vec<_>>(),
         })
     }

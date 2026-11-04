@@ -317,7 +317,9 @@ async fn main() {
     });
     shared.event(serde_json::json!({"k": "boot", "clean": clean}));
 
-    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Cmd>();
+    // Bounded: a client that can't keep up answers 503 so the driver backs off instead of
+    // piling up work that would hide how the live system behaves.
+    let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>(64);
     let flusher = shared.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_millis(5));
@@ -333,7 +335,7 @@ async fn main() {
 
 /// Runs commands one at a time: hands each to the event loop and waits until the loop has
 /// assigned it a packet id (or dropped it), so assignment events can be matched in order.
-async fn submitter(shared: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<Cmd>) {
+async fn submitter(shared: Arc<Shared>, mut rx: mpsc::Receiver<Cmd>) {
     while let Some(cmd) = rx.recv().await {
         let (id, kind, qos) = match &cmd {
             Cmd::Publish { id, qos, .. } => (*id, OpKind::Publish, *qos),
@@ -719,7 +721,7 @@ fn handle_outgoing(shared: &Arc<Shared>, out: Outgoing) {
     }
 }
 
-async fn http_server(shared: Arc<Shared>, cmd_tx: mpsc::UnboundedSender<Cmd>, listen: &str) {
+async fn http_server(shared: Arc<Shared>, cmd_tx: mpsc::Sender<Cmd>, listen: &str) {
     let listener = TcpListener::bind(listen).await.expect("bind http");
     loop {
         let Ok((mut sock, _)) = listener.accept().await else { continue };
@@ -776,15 +778,15 @@ async fn http_server(shared: Arc<Shared>, cmd_tx: mpsc::UnboundedSender<Cmd>, li
                     .unwrap(),
                 ),
                 ("POST", "/op") => match serde_json::from_slice::<Cmd>(body) {
-                    Ok(cmd) => {
-                        let _ = cmd_tx.send(cmd);
-                        (200, serde_json::json!({"accepted": true, "boot": shared.boot}).to_string())
-                    }
+                    Ok(cmd) => match cmd_tx.try_send(cmd) {
+                        Ok(()) => (200, serde_json::json!({"accepted": true, "boot": shared.boot}).to_string()),
+                        Err(_) => (503, serde_json::json!({"accepted": false, "busy": true, "boot": shared.boot}).to_string()),
+                    },
                     Err(e) => (400, serde_json::json!({"error": e.to_string()}).to_string()),
                 },
                 _ => (404, "{}".to_string()),
             };
-            let reason = if status == 200 { "OK" } else { "Error" };
+            let reason = match status { 200 => "OK", 503 => "Busy", _ => "Error" };
             let out = format!(
                 "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp}",
                 resp.len()

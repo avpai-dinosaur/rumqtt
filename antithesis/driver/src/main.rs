@@ -42,6 +42,8 @@ pub struct Driver {
     pub started: Instant,
     /// Highest QoS the workload subscribes with (MAX_SUB_QOS, default 2).
     pub max_sub_qos: u8,
+    /// Highest QoS the workload publishes with (MAX_PUB_QOS, default 2).
+    pub max_pub_qos: u8,
 }
 
 pub fn log(msg: &str) {
@@ -49,12 +51,27 @@ pub fn log(msg: &str) {
 }
 
 impl Driver {
-    fn issue(&self, ci: usize, body: Value) {
-        if let Err(e) = net::post_op(&self.agent, &self.clients[ci].url, &body) {
-            let mut m = self.model.lock().unwrap();
-            m.stats.http_failures += 1;
-            if m.active {
-                assert_sometimes!(true, "a client program is unreachable when the driver sends it an operation", &json!({"client": self.clients[ci].name, "error": e}));
+    /// Sends an op to a client. A client whose queue is full rejects it; the op is then
+    /// forgotten and the worker backs off a little.
+    fn issue(&self, ci: usize, op: u64, body: Value) {
+        match net::post_op(&self.agent, &self.clients[ci].url, &body) {
+            Ok(_) => {}
+            Err(net::PostError::Busy) => {
+                let mut m = self.model.lock().unwrap();
+                m.retract(op);
+                m.stats.busy += 1;
+                if m.active {
+                    assert_sometimes!(true, "a client program rejects an operation because its queue is full", &json!({"client": self.clients[ci].name}));
+                }
+                drop(m);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(net::PostError::Other(e)) => {
+                let mut m = self.model.lock().unwrap();
+                m.stats.http_failures += 1;
+                if m.active {
+                    assert_sometimes!(true, "a client program is unreachable when the driver sends it an operation", &json!({"client": self.clients[ci].name, "error": e}));
+                }
             }
         }
     }
@@ -62,28 +79,28 @@ impl Driver {
     pub fn publish_one(&self, ci: usize, topic: &str, qos: u8, retain: bool, size: usize, empty: bool) -> u64 {
         let op = self.next_op.fetch_add(1, Ordering::SeqCst);
         self.model.lock().unwrap().issue_publish(op, ci, topic, qos, retain, size, empty);
-        self.issue(ci, json!({"kind": "publish", "id": op, "topic": topic, "qos": qos, "retain": retain, "size": size, "empty": empty}));
+        self.issue(ci, op, json!({"kind": "publish", "id": op, "topic": topic, "qos": qos, "retain": retain, "size": size, "empty": empty}));
         op
     }
 
     pub fn subscribe_one(&self, ci: usize, filter: &str, qos: u8) -> u64 {
         let op = self.next_op.fetch_add(1, Ordering::SeqCst);
         self.model.lock().unwrap().issue_subscribe(op, ci, filter, qos);
-        self.issue(ci, json!({"kind": "subscribe", "id": op, "filter": filter, "qos": qos}));
+        self.issue(ci, op, json!({"kind": "subscribe", "id": op, "filter": filter, "qos": qos}));
         op
     }
 
     pub fn unsubscribe_one(&self, ci: usize, filter: &str) -> u64 {
         let op = self.next_op.fetch_add(1, Ordering::SeqCst);
         self.model.lock().unwrap().issue_unsubscribe(op, ci, filter);
-        self.issue(ci, json!({"kind": "unsubscribe", "id": op, "filter": filter}));
+        self.issue(ci, op, json!({"kind": "unsubscribe", "id": op, "filter": filter}));
         op
     }
 
     pub fn disconnect_one(&self, ci: usize) -> u64 {
         let op = self.next_op.fetch_add(1, Ordering::SeqCst);
         self.model.lock().unwrap().issue_disconnect(op, ci);
-        self.issue(ci, json!({"kind": "disconnect", "id": op}));
+        self.issue(ci, op, json!({"kind": "disconnect", "id": op}));
         op
     }
 
@@ -91,15 +108,16 @@ impl Driver {
         tc.draw(gs::integers::<usize>().min_value(0).max_value(self.clients.len() - 1))
     }
 
-    fn draw_qos(tc: &TestCase) -> u8 {
+    fn draw_qos(&self, tc: &TestCase) -> u8 {
         let r: u32 = tc.draw(gs::integers::<u32>().min_value(0).max_value(99));
-        if r < 30 {
+        let qos = if r < 30 {
             0
         } else if r < 70 {
             1
         } else {
             2
-        }
+        };
+        qos.min(self.max_pub_qos)
     }
 
     fn draw_size(tc: &TestCase) -> usize {
@@ -223,7 +241,7 @@ impl Driver {
     fn publish(&self, tc: TestCase) {
         let ci = self.draw_client(&tc);
         let topic = Self::draw_topic(&tc);
-        let qos = Self::draw_qos(&tc);
+        let qos = self.draw_qos(&tc);
         let retain = tc.draw(gs::weighted_booleans(0.15));
         let empty = tc.draw(gs::weighted_booleans(0.05));
         let size = if empty { 0 } else { Self::draw_size(&tc) };
@@ -234,7 +252,7 @@ impl Driver {
     fn publish_burst(&self, tc: TestCase) {
         let ci = self.draw_client(&tc);
         let topic = Self::draw_topic(&tc);
-        let qos = Self::draw_qos(&tc);
+        let qos = self.draw_qos(&tc);
         let n: usize = tc.draw(gs::integers::<usize>().min_value(3).max_value(12));
         let sizes: Vec<usize> = (0..n).map(|_| Self::draw_size(&tc)).collect();
         for size in sizes {
@@ -316,6 +334,7 @@ fn main(tc: TestCase) {
     let broker_host = std::env::var("BROKER_HOST").unwrap_or_else(|_| "broker".into());
     let broker_port: u16 = std::env::var("BROKER_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(1883);
     let max_sub_qos: u8 = std::env::var("MAX_SUB_QOS").ok().and_then(|v| v.parse().ok()).unwrap_or(2).min(2);
+    let max_pub_qos: u8 = std::env::var("MAX_PUB_QOS").ok().and_then(|v| v.parse().ok()).unwrap_or(2).min(2);
 
     let model = Arc::new(Mutex::new(Model::new(
         clients.iter().map(|c| (c.name.clone(), c.url.clone(), c.persistent)).collect(),
@@ -338,9 +357,10 @@ fn main(tc: TestCase) {
         broker_port,
         started: Instant::now(),
         max_sub_qos,
+        max_pub_qos,
     };
     log(&format!(
-        "clients: {}; strict_qos={strict_qos}; quiet_p={quiet_p}; max_sub_qos={max_sub_qos}",
+        "clients: {}; strict_qos={strict_qos}; quiet_p={quiet_p}; max_sub_qos={max_sub_qos}; max_pub_qos={max_pub_qos}",
         driver.clients.iter().map(|c| format!("{}({})", c.name, if c.persistent { "persistent" } else { "clean" })).collect::<Vec<_>>().join(", ")
     ));
     driver.wait_until_up();
