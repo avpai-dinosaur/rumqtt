@@ -73,6 +73,9 @@ struct Op {
     name: String,
     state: OpState,
     sends: u32,
+    /// A QoS 2 publish the broker has answered with PUBREC: rumqttc never re-sends its
+    /// PUBLISH again (only PUBREL), and frees its packet id for a new publish.
+    accepted: bool,
     done: Arc<Notify>,
 }
 
@@ -368,7 +371,7 @@ async fn submitter(shared: Arc<Shared>, mut rx: mpsc::Receiver<Cmd>) {
         // Register, then enqueue: the event loop can emit the assignment event the moment
         // the request is in the channel, and the handler must already find the op at the
         // head of `pending_assign`.
-        let op = Op { id, kind, qos, name, state: OpState::Queued, sends: 0, done: done.clone() };
+        let op = Op { id, kind, qos, name, state: OpState::Queued, sends: 0, accepted: false, done: done.clone() };
         shared.inner.lock().unwrap().pending_assign.push_back(op);
         let res = match req {
             Request::Publish(p) => {
@@ -516,6 +519,7 @@ fn handle_incoming(shared: &Arc<Shared>, eventloop: &mut EventLoop, packet: Pack
                                     name: op.name.clone(),
                                     state: op.state,
                                     sends: op.sends,
+                                    accepted: op.accepted,
                                     done: op.done.clone(),
                                 });
                                 false
@@ -581,7 +585,7 @@ fn evict_stale(inner: &mut Inner, pkid: u16) -> Vec<Op> {
             if op.kind == OpKind::Publish {
                 true
             } else {
-                stale.push(Op { id: op.id, kind: op.kind, qos: op.qos, name: op.name.clone(), state: op.state, sends: op.sends, done: op.done.clone() });
+                stale.push(Op { id: op.id, kind: op.kind, qos: op.qos, name: op.name.clone(), state: op.state, sends: op.sends, accepted: op.accepted, done: op.done.clone() });
                 false
             }
         });
@@ -617,14 +621,18 @@ fn finish_pkid(shared: &Arc<Shared>, pkid: u16, outcome: &str, remove: bool, qos
     let op = if remove {
         take_pkid(shared, pkid, OpKind::Publish, Some(qos))
     } else {
-        let inner = shared.inner.lock().unwrap();
-        inner.by_pkid.get(&pkid).and_then(|q| q.iter().find(|op| op.kind == OpKind::Publish && op.qos == qos)).map(|op| Op {
+        let mut inner = shared.inner.lock().unwrap();
+        inner.by_pkid.get_mut(&pkid).and_then(|q| q.iter_mut().find(|op| op.kind == OpKind::Publish && op.qos == qos)).map(|op| {
+            op.accepted = true;
+            op
+        }).map(|op| Op {
             id: op.id,
             kind: op.kind,
             qos: op.qos,
             name: op.name.clone(),
             state: op.state,
             sends: op.sends,
+            accepted: op.accepted,
             done: op.done.clone(),
         })
     };
@@ -648,7 +656,7 @@ fn handle_outgoing(shared: &Arc<Shared>, out: Outgoing) {
                 inner
                     .by_pkid
                     .get_mut(&pkid)
-                    .and_then(|q| q.iter_mut().find(|op| op.kind == OpKind::Publish && op.state != OpState::Queued))
+                    .and_then(|q| q.iter_mut().find(|op| op.kind == OpKind::Publish && op.state != OpState::Queued && !op.accepted))
             };
             if let Some(op) = existing {
                 op.sends += 1;
