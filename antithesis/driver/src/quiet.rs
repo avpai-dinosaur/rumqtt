@@ -5,7 +5,7 @@ use crate::{log, Driver, TOPICS};
 use antithesis_sdk::{assert_always, assert_reachable, assert_sometimes};
 use hegel::generators as gs;
 use hegel::TestCase;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 
 /// How long faults stay paused: longer than the whole quiet period can take.
@@ -93,11 +93,14 @@ impl Driver {
     fn drain(&self) {
         let start = Instant::now();
         loop {
-            let idle = {
+            let (idle, caught_up) = {
                 let m = self.model.lock().unwrap();
-                m.clients.iter().filter_map(|c| c.last_delivery).map(|t| t.elapsed()).min().unwrap_or(DRAIN_IDLE)
+                (
+                    m.clients.iter().filter_map(|c| c.last_delivery).map(|t| t.elapsed()).min().unwrap_or(DRAIN_IDLE),
+                    m.stats.packets >= m.stats.packets_received,
+                )
             };
-            if idle >= DRAIN_IDLE || start.elapsed() > DRAIN_MAX {
+            if (idle >= DRAIN_IDLE && caught_up) || start.elapsed() > DRAIN_MAX {
                 return;
             }
             std::thread::sleep(Duration::from_millis(250));
@@ -131,9 +134,16 @@ impl Driver {
                     checked += 1;
                     let got = msg.deliveries.get(&(si, sub.session)).copied().unwrap_or(0);
                     if got == 0 {
+                        let deliveries: Vec<Value> = msg.deliveries.iter().map(|((s, sess), n)| json!({"subscriber": m.clients[*s].name, "session": sess, "count": n})).collect();
+                        let retained: Vec<Value> = msg.retained_deliveries.iter().map(|(s, sess)| json!({"subscriber": m.clients[*s].name, "session": sess})).collect();
+                        let recent: Vec<Value> = msg.recent.iter().map(|(s, c, p, d, t)| json!({"subscriber": m.clients[*s].name, "conn": c, "pkid": p, "dup": d, "ms": t})).collect();
                         missing.push(json!({"subscriber": sub.name, "filter": e.filter, "filter_confirmed_ms": m.ms(confirmed),
-                            "session": sub.session, "op": msg.op, "topic": msg.topic, "publisher": m.clients[msg.publisher].name,
-                            "qos": msg.qos, "sent_ms": m.ms(msg.sent), "settled_ms": msg.settled().map(|t| m.ms(t)), "sends": msg.sends}));
+                            "session": sub.session, "subscriber_conn": sub.conn, "subscriber_boot": sub.boot,
+                            "conns": sub.conns.iter().map(|(k, r)| json!({"boot": k.boot, "conn": k.conn, "session": r.session, "started_ms": m.ms(r.started), "ended_ms": r.ended.map(|t| m.ms(t)), "sp": r.session_present})).collect::<Vec<_>>(),
+                            "op": msg.op, "topic": msg.topic, "publisher": m.clients[msg.publisher].name, "retain": msg.retain,
+                            "qos": msg.qos, "sent_ms": m.ms(msg.sent), "settled_ms": msg.settled().map(|t| m.ms(t)), "sends": msg.sends,
+                            "deliveries": deliveries, "retained_deliveries": retained, "recent": recent,
+                            "stats": {"packets": m.stats.packets, "packets_received": m.stats.packets_received, "lost_events": m.stats.lost_events}}));
                     }
                 }
             }
