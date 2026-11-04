@@ -1,0 +1,24 @@
+[package]
+name = "rumqttd-antithesis"
+version = "0.1.0"
+edition = "2021"
+
+# Detached from the rumqtt workspace: this crate controls its own profile (no LTO, no strip,
+# debug info kept for Antithesis symbolization) and adds the instrumentation shim.
+[workspace]
+
+[profile.release]
+opt-level = 2
+debug = 1
+codegen-units = 1
+lto = false
+strip = false
+incremental = false
+
+[dependencies]
+rumqttd = { path = "../../rumqttd", default-features = false }
+antithesis-instrumentation = "0.1"
+antithesis_sdk = "0.3"
+config = "0.14"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

@@ -1,0 +1,120 @@
+# Antithesis harness for rumqttd. Build from this directory with `docker compose build`;
+# the build contexts are the repository root so the images can build rumqttd and rumqttc
+# from source with coverage instrumentation.
+services:
+  broker:
+    container_name: broker
+    hostname: broker
+    platform: linux/amd64
+    build:
+      context: ..
+      dockerfile: antithesis/broker/Dockerfile
+    image: rumqttd-antithesis:latest
+    restart: on-failure
+    environment:
+      LOG_FORWARD_ADDR: driver:7777
+      RUST_LOG: rumqttd=info
+
+  client1:
+    container_name: client1
+    hostname: client1
+    platform: linux/amd64
+    build:
+      context: ..
+      dockerfile: antithesis/client/Dockerfile
+    image: rumqtt-client-antithesis:latest
+    restart: on-failure
+    environment:
+      CLIENT_ID: client1
+      CLEAN_SESSION: "false"
+      BROKER_HOST: broker
+      BROKER_PORT: "1883"
+      OUTCOME_ADDR: driver:7778
+      LOG_FORWARD_ADDR: driver:7777
+      RUST_LOG: rumqttc=info
+
+  client2:
+    container_name: client2
+    hostname: client2
+    platform: linux/amd64
+    build:
+      context: ..
+      dockerfile: antithesis/client/Dockerfile
+    image: rumqtt-client-antithesis:latest
+    restart: on-failure
+    environment:
+      CLIENT_ID: client2
+      CLEAN_SESSION: "false"
+      BROKER_HOST: broker
+      BROKER_PORT: "1883"
+      OUTCOME_ADDR: driver:7778
+      LOG_FORWARD_ADDR: driver:7777
+      RUST_LOG: rumqttc=info
+
+  client3:
+    container_name: client3
+    hostname: client3
+    platform: linux/amd64
+    build:
+      context: ..
+      dockerfile: antithesis/client/Dockerfile
+    image: rumqtt-client-antithesis:latest
+    restart: on-failure
+    environment:
+      CLIENT_ID: client3
+      CLEAN_SESSION: "true"
+      BROKER_HOST: broker
+      BROKER_PORT: "1883"
+      OUTCOME_ADDR: driver:7778
+      LOG_FORWARD_ADDR: driver:7777
+      RUST_LOG: rumqttc=info
+
+  client4:
+    container_name: client4
+    hostname: client4
+    platform: linux/amd64
+    build:
+      context: ..
+      dockerfile: antithesis/client/Dockerfile
+    image: rumqtt-client-antithesis:latest
+    restart: on-failure
+    environment:
+      CLIENT_ID: client4
+      CLEAN_SESSION: "true"
+      BROKER_HOST: broker
+      BROKER_PORT: "1883"
+      OUTCOME_ADDR: driver:7778
+      LOG_FORWARD_ADDR: driver:7777
+      RUST_LOG: rumqttc=info
+
+  client5:
+    container_name: client5
+    hostname: client5
+    platform: linux/amd64
+    build:
+      context: ..
+      dockerfile: antithesis/client/Dockerfile
+    image: rumqtt-client-antithesis:latest
+    restart: on-failure
+    environment:
+      CLIENT_ID: client5
+      CLEAN_SESSION: "false"
+      BROKER_HOST: broker
+      BROKER_PORT: "1883"
+      OUTCOME_ADDR: driver:7778
+      LOG_FORWARD_ADDR: driver:7777
+      RUST_LOG: rumqttc=info
+
+  driver:
+    container_name: driver
+    hostname: driver
+    platform: linux/amd64
+    build:
+      context: ..
+      dockerfile: antithesis/driver/Dockerfile
+    image: rumqtt-driver-antithesis:latest
+    environment:
+      CLIENTS: client1=persistent,client2=persistent,client3=clean,client4=clean,client5=persistent
+      BROKER_HOST: broker
+      BROKER_PORT: "1883"
+      MQTT_STRICT_QOS: "1"

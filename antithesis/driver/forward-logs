@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Run the system with its stdout and stderr through log-forward, and pass signals on to it.
+# Once it exits, let log-forward drain for up to 5 s, so the last lines, often a crash
+# message, aren't lost, but a leftover child holding the pipe can't keep the container up.
+set -m  # job control, so the system starts with SIGINT and SIGQUIT not ignored
+fifo=$(mktemp -u) && mkfifo "$fifo"
+log-forward < "$fifo" &
+forwarder=$!
+"$@" > "$fifo" 2>&1 &
+system=$!
+set +m
+for signal in TERM INT QUIT HUP USR1 USR2; do
+  trap "kill -$signal $system 2>/dev/null" "$signal"
+done
+while wait "$system"; status=$?; kill -0 "$system" 2>/dev/null; do :; done
+(sleep 5; kill "$forwarder" 2>/dev/null) &
+wait "$forwarder"
+rm -f "$fifo"
+exit "$status"

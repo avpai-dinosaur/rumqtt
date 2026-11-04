@@ -1,0 +1,6 @@
+# Local overrides: SDK output to a file, and a frequent quiet period so it can be checked.
+services:
+  driver:
+    environment:
+      ANTITHESIS_SDK_LOCAL_OUTPUT: /tmp/sdk.jsonl
+      QUIET_P: "0.0002"

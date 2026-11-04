@@ -1,0 +1,26 @@
+[package]
+name = "mqtt-client"
+version = "0.1.0"
+edition = "2021"
+
+# Detached from the rumqtt workspace: this crate controls its own profile (no LTO, no strip,
+# debug info kept for Antithesis symbolization) and adds the instrumentation shim.
+[workspace]
+
+[profile.release]
+opt-level = 2
+debug = 1
+codegen-units = 1
+lto = false
+strip = false
+incremental = false
+
+[dependencies]
+rumqttc = { path = "../../rumqttc", default-features = false }
+antithesis-instrumentation = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+crc32fast = "1"
+log = "0.4"
+env_logger = "0.11"

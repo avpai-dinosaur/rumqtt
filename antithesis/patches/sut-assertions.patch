@@ -1,0 +1,303 @@
+diff -ruN a/rumqttc/Cargo.toml b/rumqttc/Cargo.toml
+--- a/rumqttc/Cargo.toml	2026-11-04 21:12:27.630044992 +0000
++++ b/rumqttc/Cargo.toml	2026-11-04 21:12:27.682045248 +0000
+@@ -51,6 +51,7 @@
+ async-http-proxy = { version = "1.2.5", features = ["runtime-tokio", "basic-auth"], optional = true }
+ tokio-stream = "0.1.16"
+ fixedbitset = "0.5.7"
++antithesis_sdk = "0.3"
+ 
+ [dev-dependencies]
+ bincode = "1.3.3"
+diff -ruN a/rumqttc/src/eventloop.rs b/rumqttc/src/eventloop.rs
+--- a/rumqttc/src/eventloop.rs	2026-11-04 21:12:27.638045032 +0000
++++ b/rumqttc/src/eventloop.rs	2026-11-04 21:12:27.682045248 +0000
+@@ -127,7 +127,13 @@
+     pub fn clean(&mut self) {
+         self.network = None;
+         self.keepalive_timeout = None;
+-        self.pending.extend(self.state.clean());
++        let unacked = self.state.clean();
++        antithesis_sdk::assert_sometimes!(
++            !unacked.is_empty(),
++            "rumqttc: unacknowledged publishes are queued for retransmission after a disconnect",
++            &antithesis_sdk::serde_json::json!({"count": unacked.len()})
++        );
++        self.pending.extend(unacked);
+ 
+         // drain requests from channel which weren't yet received
+         let mut requests_in_channel: Vec<_> = self.requests_rx.drain().collect();
+@@ -159,7 +165,18 @@
+             };
+             // Last session might contain packets which aren't acked. If it's a new session, clear the pending packets.
+             if !connack.session_present {
++                antithesis_sdk::assert_sometimes!(
++                    !self.pending.is_empty(),
++                    "rumqttc: pending retransmissions are discarded because the session was not resumed",
++                    &antithesis_sdk::serde_json::json!({"count": self.pending.len()})
++                );
+                 self.pending.clear();
++            } else {
++                antithesis_sdk::assert_sometimes!(
++                    !self.pending.is_empty(),
++                    "rumqttc: pending retransmissions are re-sent on a resumed session",
++                    &antithesis_sdk::serde_json::json!({"count": self.pending.len()})
++                );
+             }
+             self.network = Some(network);
+ 
+diff -ruN a/rumqttc/src/state.rs b/rumqttc/src/state.rs
+--- a/rumqttc/src/state.rs	2026-11-04 21:12:27.646045072 +0000
++++ b/rumqttc/src/state.rs	2026-11-04 21:12:27.694045308 +0000
+@@ -229,6 +229,11 @@
+ 
+         if publish.take().is_none() {
+             error!("Unsolicited puback packet: {:?}", puback.pkid);
++            antithesis_sdk::assert_sometimes!(
++                true,
++                "rumqttc: an unsolicited PUBACK is received",
++                &antithesis_sdk::serde_json::json!({"pkid": puback.pkid})
++            );
+             return Err(StateError::Unsolicited(puback.pkid));
+         }
+ 
+@@ -270,6 +275,11 @@
+     fn handle_incoming_pubrel(&mut self, pubrel: &PubRel) -> Result<Option<Packet>, StateError> {
+         if !self.incoming_pub.contains(pubrel.pkid as usize) {
+             error!("Unsolicited pubrel packet: {:?}", pubrel.pkid);
++            antithesis_sdk::assert_sometimes!(
++                true,
++                "rumqttc: an unsolicited PUBREL is received",
++                &antithesis_sdk::serde_json::json!({"pkid": pubrel.pkid})
++            );
+             return Err(StateError::Unsolicited(pubrel.pkid));
+         }
+ 
+@@ -284,6 +294,11 @@
+     fn handle_incoming_pubcomp(&mut self, pubcomp: &PubComp) -> Result<Option<Packet>, StateError> {
+         if !self.outgoing_rel.contains(pubcomp.pkid as usize) {
+             error!("Unsolicited pubcomp packet: {:?}", pubcomp.pkid);
++            antithesis_sdk::assert_sometimes!(
++                true,
++                "rumqttc: an unsolicited PUBCOMP is received",
++                &antithesis_sdk::serde_json::json!({"pkid": pubcomp.pkid})
++            );
+             return Err(StateError::Unsolicited(pubcomp.pkid));
+         }
+ 
+@@ -322,6 +337,11 @@
+                 .is_some()
+             {
+                 info!("Collision on packet id = {:?}", publish.pkid);
++                antithesis_sdk::assert_sometimes!(
++                    true,
++                    "rumqttc: a packet id collision parks a publish",
++                    &antithesis_sdk::serde_json::json!({"pkid": pkid})
++                );
+                 self.collision = Some(publish);
+                 let event = Event::Outgoing(Outgoing::AwaitAck(pkid));
+                 self.events.push_back(event);
+@@ -387,6 +407,11 @@
+ 
+         // raise error if last ping didn't receive ack
+         if self.await_pingresp {
++            antithesis_sdk::assert_sometimes!(
++                true,
++                "rumqttc: a ping goes unanswered and the connection is dropped",
++                &antithesis_sdk::serde_json::json!({})
++            );
+             return Err(StateError::AwaitPingResp);
+         }
+ 
+diff -ruN a/rumqttd/Cargo.toml b/rumqttd/Cargo.toml
+--- a/rumqttd/Cargo.toml	2026-11-04 21:12:27.614044914 +0000
++++ b/rumqttd/Cargo.toml	2026-11-04 21:12:27.650045091 +0000
+@@ -39,6 +39,7 @@
+ rand = "0.8.5"
+ uuid = { version = "1.7.0", features = ["v4", "fast-rng"] }
+ subtle = "2.5"
++antithesis_sdk = "0.3"
+ 
+ [features]
+ default = ["use-rustls", "websocket"]
+diff -ruN a/rumqttd/src/router/routing.rs b/rumqttd/src/router/routing.rs
+--- a/rumqttd/src/router/routing.rs	2026-11-04 21:12:27.618044934 +0000
++++ b/rumqttd/src/router/routing.rs	2026-11-04 21:12:27.678045229 +0000
+@@ -289,6 +289,10 @@
+                     "Duplicate client_id, dropping previous connection with connection_id: {}",
+                     connection_id
+                 );
++                antithesis_sdk::assert_reachable!(
++                    "rumqttd: a new connection replaces an existing one with the same client id",
++                    &antithesis_sdk::serde_json::json!({"client_id": client_id})
++                );
+                 self.handle_disconnection(*connection_id, None);
+             }
+         }
+@@ -304,6 +308,11 @@
+         let saved = self.graveyard.retrieve(&client_id);
+         let clean_session = connection.clean;
+         let previous_session = saved.as_ref().is_some_and(|s| s.session_state.is_some());
++        antithesis_sdk::assert_sometimes!(
++            !clean_session && previous_session,
++            "rumqttd: a persistent session is restored from the graveyard",
++            &antithesis_sdk::serde_json::json!({"client_id": client_id})
++        );
+         // for qos2 pending pubrels
+         let mut pending_acks = VecDeque::new();
+ 
+@@ -348,10 +357,15 @@
+         }
+ 
+         if let Some(will) = connection.last_will.take() {
+-            self.last_wills.insert(
++            let replaced = self.last_wills.insert(
+                 client_id.clone(),
+                 (will, connection.last_will_properties.take()),
+             );
++            antithesis_sdk::assert_sometimes!(
++                replaced.is_some(),
++                "rumqttd: a new connection overwrites the stored will of a previous connection with the same client id",
++                &antithesis_sdk::serde_json::json!({"client_id": client_id})
++            );
+         }
+ 
+         let connection_id = self.connections.insert(connection);
+@@ -465,6 +479,11 @@
+ 
+         let inflight_data_requests = self.datalog.clean(id);
+         let retransmissions = outgoing.retransmission_map();
++        antithesis_sdk::assert_sometimes!(
++            !retransmissions.is_empty(),
++            "rumqttd: a disconnecting client leaves unacknowledged forwards to rewind",
++            &antithesis_sdk::serde_json::json!({"client_id": client_id, "filters": retransmissions.len()})
++        );
+ 
+         // Remove connections from all groups and
+         // discard empty group ( group with no client )
+@@ -768,6 +787,10 @@
+                     let pkid = puback.pkid;
+                     if outgoing.register_ack(pkid).is_none() {
+                         error!(pkid, "Unsolicited/ooo ack received for pkid {}", pkid);
++                        antithesis_sdk::assert_unreachable!(
++                            "rumqttd: a PUBACK or PUBREC names a packet id that is not at the head of the inflight queue",
++                            &antithesis_sdk::serde_json::json!({"client_id": client_id, "pkid": pkid})
++                        );
+                         disconnect = true;
+                         break;
+                     }
+@@ -782,6 +805,10 @@
+                     let pkid = pubrec.pkid;
+                     if outgoing.register_ack(pkid).is_none() {
+                         error!(pkid, "Unsolicited/ooo ack received for pkid {}", pkid);
++                        antithesis_sdk::assert_unreachable!(
++                            "rumqttd: a PUBACK or PUBREC names a packet id that is not at the head of the inflight queue",
++                            &antithesis_sdk::serde_json::json!({"client_id": client_id, "pkid": pkid})
++                        );
+                         disconnect = true;
+                         break;
+                     }
+@@ -813,6 +840,10 @@
+                     let (publish, props) = match ackslog.pubcomp(pubcomp) {
+                         Some(v) => v,
+                         None => {
++                            antithesis_sdk::assert_unreachable!(
++                                "rumqttd: a PUBREL arrives with no recorded QoS 2 publish to release",
++                                &antithesis_sdk::serde_json::json!({"client_id": client_id, "pkid": pubrel.pkid})
++                            );
+                             disconnect = true;
+                             break;
+                         }
+@@ -852,6 +883,10 @@
+                     let outgoing = self.obufs.get_mut(id).unwrap();
+                     let pkid = pubcomp.pkid;
+                     if outgoing.register_pubcomp(pkid).is_none() {
++                        antithesis_sdk::assert_unreachable!(
++                            "rumqttd: a PUBCOMP names a packet id with no pending PUBREL",
++                            &antithesis_sdk::serde_json::json!({"client_id": client_id, "pkid": pkid})
++                        );
+                         error!(
+                             pkid,
+                             "ack received for pkid {}, but the pkid didn't exists!", pkid
+@@ -869,6 +904,10 @@
+                 Packet::Disconnect(_, _) => {
+                     let span = tracing::info_span!("disconnect");
+                     let _guard = span.enter();
++                    antithesis_sdk::assert_reachable!(
++                        "rumqttd: a client sends DISCONNECT",
++                        &antithesis_sdk::serde_json::json!({"client_id": client_id})
++                    );
+                     disconnect = true;
+                     // delete the last will message
+                     self.last_wills.remove(&client_id);
+@@ -1059,11 +1098,21 @@
+                 shared_group,
+             ) {
+                 ConsumeStatus::BufferFull => {
++                    antithesis_sdk::assert_sometimes!(
++                        true,
++                        "rumqttd: a subscriber's outgoing buffer fills up",
++                        &antithesis_sdk::serde_json::json!({"client_id": outgoing.client_id})
++                    );
+                     requests.push_back(request);
+                     self.scheduler.pause(id, PauseReason::Busy);
+                     break;
+                 }
+                 ConsumeStatus::InflightFull => {
++                    antithesis_sdk::assert_sometimes!(
++                        true,
++                        "rumqttd: a subscriber's inflight window fills up",
++                        &antithesis_sdk::serde_json::json!({"client_id": outgoing.client_id})
++                    );
+                     requests.push_back(request);
+                     self.scheduler.pause(id, PauseReason::InflightFull);
+                     break;
+@@ -1101,8 +1150,16 @@
+         let tenant_prefix = tenant_id.map(|id| format!("/tenants/{id}/"));
+ 
+         let Some((will, will_props)) = self.last_wills.remove(&client_id) else {
++            antithesis_sdk::assert_reachable!(
++                "rumqttd: a will publish finds no stored will (DISCONNECT cleared it or it was already published)",
++                &antithesis_sdk::serde_json::json!({"client_id": client_id})
++            );
+             return;
+         };
++        antithesis_sdk::assert_reachable!(
++            "rumqttd: a will message is published",
++            &antithesis_sdk::serde_json::json!({"client_id": client_id})
++        );
+ 
+         let publish = Publish {
+             dup: false,
+@@ -1466,6 +1523,11 @@
+         // and skip the messages previously read while reading next time.
+         // but for now, we just try to read all messages and drop the excess ones
+         let mut retained_publishes = datalog.read_retained_messages(&request.filter);
++        antithesis_sdk::assert_sometimes!(
++            !retained_publishes.is_empty(),
++            "rumqttd: retained messages are forwarded to a new subscription",
++            &antithesis_sdk::serde_json::json!({"filter": request.filter, "count": retained_publishes.len()})
++        );
+         retained_publishes.truncate(inflight_slots as usize);
+ 
+         publishes.extend(retained_publishes.into_iter().map(|p| (p, None)));
+diff -ruN a/rumqttd/src/server/broker.rs b/rumqttd/src/server/broker.rs
+--- a/rumqttd/src/server/broker.rs	2026-11-04 21:12:27.626044972 +0000
++++ b/rumqttd/src/server/broker.rs	2026-11-04 21:12:27.678045229 +0000
+@@ -541,6 +541,16 @@
+         } else {
+             AwaitingWill::Cancel
+         };
++        antithesis_sdk::assert_sometimes!(
++            clean_session,
++            "rumqttd: a reconnecting clean-session client fires the pending will of its previous connection",
++            &antithesis_sdk::serde_json::json!({"client_id": client_id})
++        );
++        antithesis_sdk::assert_sometimes!(
++            !clean_session,
++            "rumqttd: a reconnecting persistent client cancels the pending will of its previous connection",
++            &antithesis_sdk::serde_json::json!({"client_id": client_id})
++        );
+         sender.try_send(awaiting_will).unwrap();
+     }
+ 
