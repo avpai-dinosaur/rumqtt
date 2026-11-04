@@ -44,6 +44,8 @@ pub struct Driver {
     pub max_sub_qos: u8,
     /// Highest QoS the workload publishes with (MAX_PUB_QOS, default 2).
     pub max_pub_qos: u8,
+    /// Invocations per rule: publish, burst, subscribe, unsubscribe, disconnect.
+    pub rule_counts: [AtomicU64; 5],
 }
 
 pub fn log(msg: &str) {
@@ -64,7 +66,7 @@ impl Driver {
                     assert_sometimes!(true, "a client program rejects an operation because its queue is full", &json!({"client": self.clients[ci].name}));
                 }
                 drop(m);
-                std::thread::sleep(Duration::from_millis(20));
+                std::thread::sleep(Duration::from_millis(5));
             }
             Err(net::PostError::Other(e)) => {
                 let mut m = self.model.lock().unwrap();
@@ -237,33 +239,70 @@ impl Driver {
 
 #[hegel::concurrent_state_machine]
 impl Driver {
-    #[rule(weight = 10.0)]
-    fn publish(&self, tc: TestCase) {
-        let ci = self.draw_client(&tc);
-        let topic = Self::draw_topic(&tc);
-        let qos = self.draw_qos(&tc);
+    /// One action per step, drawn with explicit probabilities (hegel's rule weights are only
+    /// a hint, and the disconnect rate must stay low).
+    #[rule]
+    fn step(&self, tc: TestCase) {
+        let pick: u32 = tc.draw(gs::integers::<u32>().min_value(0).max_value(999));
+        if pick < 600 {
+            self.act_publish(&tc);
+        } else if pick < 720 {
+            self.act_publish_burst(&tc);
+        } else if pick < 900 {
+            self.act_subscribe(&tc);
+        } else if pick < 997 {
+            self.act_unsubscribe(&tc);
+        } else {
+            self.act_disconnect(&tc);
+        }
+    }
+
+    #[invariant(always_run)]
+    fn maintenance(&self, tc: TestCase) {
+        let quiet = tc.draw(gs::weighted_booleans(self.quiet_p));
+        let round = self.rounds.fetch_add(1, Ordering::SeqCst) + 1;
+        {
+            let mut m = self.model.lock().unwrap();
+            m.sweep();
+            if round % 2000 == 0 {
+                let rules: Vec<u64> = self.rule_counts.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+                log(&format!("round {round}, {:.0} s, rules(pub,burst,sub,unsub,disc)={rules:?}: {}", self.started.elapsed().as_secs_f64(), m.summary()));
+            }
+        }
+        if quiet {
+            self.quiet_period(&tc);
+        }
+    }
+}
+
+impl Driver {
+    fn act_publish(&self, tc: &TestCase) {
+        self.rule_counts[0].fetch_add(1, Ordering::Relaxed);
+        let ci = self.draw_client(tc);
+        let topic = Self::draw_topic(tc);
+        let qos = self.draw_qos(tc);
         let retain = tc.draw(gs::weighted_booleans(0.15));
         let empty = tc.draw(gs::weighted_booleans(0.05));
-        let size = if empty { 0 } else { Self::draw_size(&tc) };
+        let size = if empty { 0 } else { Self::draw_size(tc) };
         self.publish_one(ci, topic, qos, retain, size, empty);
     }
 
-    #[rule(weight = 2.0)]
-    fn publish_burst(&self, tc: TestCase) {
-        let ci = self.draw_client(&tc);
-        let topic = Self::draw_topic(&tc);
-        let qos = self.draw_qos(&tc);
+    fn act_publish_burst(&self, tc: &TestCase) {
+        self.rule_counts[1].fetch_add(1, Ordering::Relaxed);
+        let ci = self.draw_client(tc);
+        let topic = Self::draw_topic(tc);
+        let qos = self.draw_qos(tc);
         let n: usize = tc.draw(gs::integers::<usize>().min_value(3).max_value(12));
-        let sizes: Vec<usize> = (0..n).map(|_| Self::draw_size(&tc)).collect();
+        let sizes: Vec<usize> = (0..n).map(|_| Self::draw_size(tc)).collect();
         for size in sizes {
             self.publish_one(ci, topic, qos, false, size, false);
         }
     }
 
-    #[rule(weight = 3.0)]
-    fn subscribe(&self, tc: TestCase) {
-        let ci = self.draw_client(&tc);
-        let filter = Self::draw_filter(&tc);
+    fn act_subscribe(&self, tc: &TestCase) {
+        self.rule_counts[2].fetch_add(1, Ordering::Relaxed);
+        let ci = self.draw_client(tc);
+        let filter = Self::draw_filter(tc);
         let qos: u8 = tc.draw(gs::integers::<u8>().min_value(0).max_value(self.max_sub_qos));
         let already = self.model.lock().unwrap().live_filters(ci).iter().any(|f| f == filter);
         if already && self.model.lock().unwrap().active {
@@ -272,9 +311,9 @@ impl Driver {
         self.subscribe_one(ci, filter, qos);
     }
 
-    #[rule(weight = 1.5)]
-    fn unsubscribe(&self, tc: TestCase) {
-        let ci = self.draw_client(&tc);
+    fn act_unsubscribe(&self, tc: &TestCase) {
+        self.rule_counts[3].fetch_add(1, Ordering::Relaxed);
+        let ci = self.draw_client(tc);
         let pick: usize = tc.draw(gs::integers::<usize>().min_value(0).max_value(9));
         let unknown = tc.draw(gs::weighted_booleans(0.1));
         let live = self.model.lock().unwrap().live_filters(ci);
@@ -286,26 +325,10 @@ impl Driver {
         self.unsubscribe_one(ci, &filter);
     }
 
-    #[rule(weight = 0.05)]
-    fn disconnect(&self, tc: TestCase) {
-        let ci = self.draw_client(&tc);
+    fn act_disconnect(&self, tc: &TestCase) {
+        self.rule_counts[4].fetch_add(1, Ordering::Relaxed);
+        let ci = self.draw_client(tc);
         self.disconnect_one(ci);
-    }
-
-    #[invariant(always_run)]
-    fn maintenance(&self, tc: TestCase) {
-        let quiet = tc.draw(gs::weighted_booleans(self.quiet_p));
-        let round = self.rounds.fetch_add(1, Ordering::SeqCst) + 1;
-        {
-            let mut m = self.model.lock().unwrap();
-            m.sweep();
-            if round % 2000 == 0 {
-                log(&format!("round {round}, {:.0} s: {}", self.started.elapsed().as_secs_f64(), m.summary()));
-            }
-        }
-        if quiet {
-            self.quiet_period(&tc);
-        }
     }
 }
 
@@ -358,6 +381,7 @@ fn main(tc: TestCase) {
         started: Instant::now(),
         max_sub_qos,
         max_pub_qos,
+        rule_counts: Default::default(),
     };
     log(&format!(
         "clients: {}; strict_qos={strict_qos}; quiet_p={quiet_p}; max_sub_qos={max_sub_qos}; max_pub_qos={max_pub_qos}",
