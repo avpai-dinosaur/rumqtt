@@ -635,6 +635,11 @@ impl Model {
                     let ack_session = c.conns.get(&key).map(|r| r.session);
                     let Some(e) = c.epochs.iter_mut().find(|e| e.sub_op == op) else { return };
                     if let Some(s) = ack_session {
+                        if s != e.session && e.unsub_op.is_none() {
+                            // It was marked ended when its old session ended; it is live on
+                            // the connection that acknowledged it.
+                            e.ended = None;
+                        }
                         e.session = s;
                     }
                     assert_always!(codes.len() == 1, "a SUBACK carries one return code per requested filter (MQTT-3.8.4-5)", &json!({"client": name, "filter": e.filter, "codes": codes}));
