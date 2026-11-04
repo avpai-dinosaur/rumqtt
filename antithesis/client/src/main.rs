@@ -69,6 +69,8 @@ struct Op {
     id: u64,
     kind: OpKind,
     qos: u8,
+    /// Topic or filter of the request, for the logs.
+    name: String,
     state: OpState,
     sends: u32,
     done: Arc<Notify>,
@@ -190,7 +192,7 @@ impl Shared {
     }
 
     fn op_result(&self, op: &Op, outcome: &str, extra: serde_json::Value) {
-        let mut v = serde_json::json!({"k": "op", "op": op.id, "outcome": outcome, "qos": op.qos});
+        let mut v = serde_json::json!({"k": "op", "op": op.id, "outcome": outcome, "qos": op.qos, "name": op.name});
         if let (serde_json::Value::Object(m), serde_json::Value::Object(e)) = (&mut v, extra) {
             for (k, val) in e {
                 m.insert(k, val);
@@ -337,11 +339,11 @@ async fn main() {
 /// assigned it a packet id (or dropped it), so assignment events can be matched in order.
 async fn submitter(shared: Arc<Shared>, mut rx: mpsc::Receiver<Cmd>) {
     while let Some(cmd) = rx.recv().await {
-        let (id, kind, qos) = match &cmd {
-            Cmd::Publish { id, qos, .. } => (*id, OpKind::Publish, *qos),
-            Cmd::Subscribe { id, qos, .. } => (*id, OpKind::Subscribe, *qos),
-            Cmd::Unsubscribe { id, .. } => (*id, OpKind::Unsubscribe, 0),
-            Cmd::Disconnect { id } => (*id, OpKind::Disconnect, 0),
+        let (id, kind, qos, name) = match &cmd {
+            Cmd::Publish { id, qos, topic, .. } => (*id, OpKind::Publish, *qos, topic.clone()),
+            Cmd::Subscribe { id, qos, filter, .. } => (*id, OpKind::Subscribe, *qos, filter.clone()),
+            Cmd::Unsubscribe { id, filter, .. } => (*id, OpKind::Unsubscribe, 0, filter.clone()),
+            Cmd::Disconnect { id } => (*id, OpKind::Disconnect, 0, String::new()),
         };
         let done = Arc::new(Notify::new());
         let req = match &cmd {
@@ -366,7 +368,7 @@ async fn submitter(shared: Arc<Shared>, mut rx: mpsc::Receiver<Cmd>) {
         // Register, then enqueue: the event loop can emit the assignment event the moment
         // the request is in the channel, and the handler must already find the op at the
         // head of `pending_assign`.
-        let op = Op { id, kind, qos, state: OpState::Queued, sends: 0, done: done.clone() };
+        let op = Op { id, kind, qos, name, state: OpState::Queued, sends: 0, done: done.clone() };
         shared.inner.lock().unwrap().pending_assign.push_back(op);
         let res = match req {
             Request::Publish(p) => {
@@ -511,6 +513,7 @@ fn handle_incoming(shared: &Arc<Shared>, eventloop: &mut EventLoop, packet: Pack
                                     id: op.id,
                                     kind: op.kind,
                                     qos: op.qos,
+                                    name: op.name.clone(),
                                     state: op.state,
                                     sends: op.sends,
                                     done: op.done.clone(),
@@ -578,7 +581,7 @@ fn evict_stale(inner: &mut Inner, pkid: u16) -> Vec<Op> {
             if op.kind == OpKind::Publish {
                 true
             } else {
-                stale.push(Op { id: op.id, kind: op.kind, qos: op.qos, state: op.state, sends: op.sends, done: op.done.clone() });
+                stale.push(Op { id: op.id, kind: op.kind, qos: op.qos, name: op.name.clone(), state: op.state, sends: op.sends, done: op.done.clone() });
                 false
             }
         });
@@ -614,6 +617,7 @@ fn finish_pkid(shared: &Arc<Shared>, pkid: u16, outcome: &str, remove: bool) {
             id: op.id,
             kind: op.kind,
             qos: op.qos,
+            name: op.name.clone(),
             state: op.state,
             sends: op.sends,
             done: op.done.clone(),

@@ -721,7 +721,13 @@ impl Model {
                 let sent = self.clients[pidx].conns.get(&wkey).map(|r| r.started).unwrap_or(now);
                 self.clients[pidx].will_seen.entry(wkey).or_insert(now);
                 let eligible = matching.iter().any(|&i| lt(sent, self.clients[idx].epochs[i].ended));
-                assert_always!(eligible, "a will message is delivered only to a matching live subscription", &json!({"subscriber": name, "topic": topic, "will_of": pub_name, "conn": attempt}));
+                if eligible {
+                    assert_always!(true, "a will message is delivered only to a matching live subscription", &json!({}));
+                } else {
+                    assert_always!(false, "a will message is delivered only to a matching live subscription",
+                        &json!({"subscriber": name, "topic": topic, "will_of": pub_name, "conn": attempt, "qos": qos, "retain": retain,
+                                "will_conn_started_ms": self.ms(sent), "session": session, "epochs": self.describe_epochs(idx, session)}));
+                }
                 if self.active {
                     assert_sometimes!(true, "a will message is delivered after a client's connection is lost (MQTT-3.1.2-8)", &json!({"will_of": pub_name, "subscriber": name}));
                     assert_sometimes!(retain, "a retained will message is delivered to a new subscription (MQTT-3.1.2-17)", &json!({"will_of": pub_name}));
