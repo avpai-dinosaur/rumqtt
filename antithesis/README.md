@@ -99,6 +99,15 @@ Use `--fault-tolerance high_availability` to add container kills and partitions.
 broker keeps all state in memory, so a kill loses every session; the model accounts for
 that through the `session_present` flag and the broker's boot id in its forwarded logs.
 
-`MQTT_STRICT_QOS=0` on the driver relaxes the two checks that depend on the spec's
-"forward at min(published QoS, granted QoS)" rule, which rumqttd does not implement (it
-forwards at the subscription's QoS).
+## Driver knobs (environment variables on the `driver` service)
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `MQTT_STRICT_QOS` | `1` | `0` relaxes the two checks that depend on the spec's "forward at min(published QoS, granted QoS)" rule, which rumqttd does not implement (it forwards at the subscription's QoS). |
+| `MAX_SUB_QOS` / `MAX_PUB_QOS` | `2` | Highest QoS the workload subscribes/publishes with. `variants/qos1/` sets both to 1 to look past the known QoS 2 reconnect livelocks. |
+| `QUIET_P` | `0.00005` | Chance per round of a quiet period (about one every few minutes). `docker-compose.local.yaml` raises it for local checks. |
+| `CLIENTS` | from compose | `name=persistent|clean,...`; the client containers must match. |
+
+The driver prints a summary every 2000 rounds (`docker compose logs driver`): the action
+mix, events received vs processed (a growing gap means the driver can't keep up), lost or
+duplicate events, and each client's live subscriptions.
