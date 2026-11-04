@@ -542,9 +542,9 @@ fn handle_incoming(shared: &Arc<Shared>, eventloop: &mut EventLoop, packet: Pack
                 "retain": p.retain, "dup": p.dup, "pkid": p.pkid, "len": p.payload.len(),
                 "payload": parsed}));
         }
-        Packet::PubAck(a) => finish_pkid(shared, a.pkid, "acked", true),
-        Packet::PubRec(r) => finish_pkid(shared, r.pkid, "accepted", false),
-        Packet::PubComp(c) => finish_pkid(shared, c.pkid, "completed", true),
+        Packet::PubAck(a) => finish_pkid(shared, a.pkid, "acked", true, 1),
+        Packet::PubRec(r) => finish_pkid(shared, r.pkid, "accepted", false, 2),
+        Packet::PubComp(c) => finish_pkid(shared, c.pkid, "completed", true, 2),
         Packet::SubAck(s) => {
             let codes: Vec<i32> = s
                 .return_codes
@@ -554,7 +554,7 @@ fn handle_incoming(shared: &Arc<Shared>, eventloop: &mut EventLoop, packet: Pack
                     rumqttc::SubscribeReasonCode::Failure => 128,
                 })
                 .collect();
-            let op = take_pkid(shared, s.pkid);
+            let op = take_pkid(shared, s.pkid, OpKind::Subscribe, None);
             match op {
                 Some(op) => {
                     shared.op_result(&op, "suback", serde_json::json!({"codes": codes}));
@@ -562,7 +562,7 @@ fn handle_incoming(shared: &Arc<Shared>, eventloop: &mut EventLoop, packet: Pack
                 None => shared.event(serde_json::json!({"k": "stray_ack", "what": "suback", "pkid": s.pkid})),
             }
         }
-        Packet::UnsubAck(u) => match take_pkid(shared, u.pkid) {
+        Packet::UnsubAck(u) => match take_pkid(shared, u.pkid, OpKind::Unsubscribe, None) {
             Some(op) => shared.op_result(&op, "unsuback", serde_json::json!({})),
             None => shared.event(serde_json::json!({"k": "stray_ack", "what": "unsuback", "pkid": u.pkid})),
         },
@@ -598,22 +598,27 @@ fn report_stale(shared: &Arc<Shared>, stale: Vec<Op>) {
     }
 }
 
-fn take_pkid(shared: &Arc<Shared>, pkid: u16) -> Option<Op> {
+/// Takes the oldest op of `kind` holding this packet id: an ack is only ever for a request
+/// of its own kind, and a late SUBACK/UNSUBACK must not consume a publish that reused the id.
+fn take_pkid(shared: &Arc<Shared>, pkid: u16, kind: OpKind, qos: Option<u8>) -> Option<Op> {
     let mut inner = shared.inner.lock().unwrap();
     let q = inner.by_pkid.get_mut(&pkid)?;
-    let op = q.pop_front();
+    let pos = q.iter().position(|op| op.kind == kind && qos.map_or(true, |q| op.qos == q))?;
+    let op = q.remove(pos);
     if q.is_empty() {
         inner.by_pkid.remove(&pkid);
     }
     op
 }
 
-fn finish_pkid(shared: &Arc<Shared>, pkid: u16, outcome: &str, remove: bool) {
+/// Resolves a PUBACK (QoS 1) or PUBREC/PUBCOMP (QoS 2) against the publish of that QoS
+/// holding the packet id; ids are reused across flows once rumqttc's counter wraps.
+fn finish_pkid(shared: &Arc<Shared>, pkid: u16, outcome: &str, remove: bool, qos: u8) {
     let op = if remove {
-        take_pkid(shared, pkid)
+        take_pkid(shared, pkid, OpKind::Publish, Some(qos))
     } else {
         let inner = shared.inner.lock().unwrap();
-        inner.by_pkid.get(&pkid).and_then(|q| q.front()).map(|op| Op {
+        inner.by_pkid.get(&pkid).and_then(|q| q.iter().find(|op| op.kind == OpKind::Publish && op.qos == qos)).map(|op| Op {
             id: op.id,
             kind: op.kind,
             qos: op.qos,
