@@ -1,0 +1,36 @@
+name: rumqtt
+
+services:
+  broker:
+    image: ${REPOSITORY}/rumqttd:latest
+    hostname: broker
+
+  client1:
+    image: ${REPOSITORY}/rumqttc:latest
+    hostname: client1
+    environment:
+      MQTT_HOST: broker
+      MQTT_PORT: "1883"
+      CLIENT_ID: client1
+    depends_on:
+      - broker
+
+  client2:
+    image: ${REPOSITORY}/rumqttc:latest
+    hostname: client2
+    environment:
+      MQTT_HOST: broker
+      MQTT_PORT: "1883"
+      CLIENT_ID: client2
+    depends_on:
+      - broker
+
+  client3:
+    image: ${REPOSITORY}/rumqttc:latest
+    hostname: client3
+    environment:
+      MQTT_HOST: broker
+      MQTT_PORT: "1883"
+      CLIENT_ID: client3
+    depends_on:
+      - broker

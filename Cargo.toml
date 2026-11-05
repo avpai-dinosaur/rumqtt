@@ -4,6 +4,7 @@ members = [
   "rumqttd",
   "benchmarks",
   "benchmarks/simplerouter",
+  "antithesis/client",
 ]
 resolver = "2"
 
