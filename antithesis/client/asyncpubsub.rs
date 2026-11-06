@@ -39,12 +39,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
         subscribed.clone(),
     ));
 
+    let mut need_subscribe = false;
     loop {
+        if need_subscribe && client.try_subscribe(TOPIC_FILTER, QoS::AtLeastOnce).is_ok() {
+            println!("[{client_id}] connected, subscribing to {TOPIC_FILTER}");
+            need_subscribe = false;
+        }
         match eventloop.poll().await {
             Ok(Event::Incoming(Packet::ConnAck(_))) => {
                 // Clean session: re-subscribe on every (re)connect.
-                println!("[{client_id}] connected, subscribing to {TOPIC_FILTER}");
-                client.try_subscribe(TOPIC_FILTER, QoS::AtLeastOnce)?;
+                need_subscribe = true;
             }
             Ok(Event::Incoming(Packet::SubAck(_))) => {
                 println!("[{client_id}] subscribed");
