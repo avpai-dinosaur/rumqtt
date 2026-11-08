@@ -10,6 +10,7 @@ path = "asyncpubsub.rs"
 
 [dependencies]
 antithesis_sdk = "0.3.0"
+crc32fast = "1.5.3"
 rumqttc = { path = "../../rumqttc", default-features = false }
 serde_json = "1.0.154"
 tokio = { version = "1.36", features = ["rt", "macros", "sync", "time"] }

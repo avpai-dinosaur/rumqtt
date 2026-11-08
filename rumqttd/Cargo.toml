@@ -39,6 +39,10 @@ axum = "0.7.4"
 rand = "0.8.5"
 uuid = { version = "1.7.0", features = ["v4", "fast-rng"] }
 subtle = "2.5"
+antithesis_sdk = { version = "0.3.0", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+antithesis-instrumentation = { version = "0.1.1", optional = true }
 
 [features]
 default = ["use-rustls", "websocket"]
@@ -48,6 +52,8 @@ websocket = ["dep:async-tungstenite", "dep:tokio-util", "dep:futures-util", "dep
 verify-client-cert = []
 validate-tenant-prefix = ["verify-client-cert"]
 allow-duplicate-clientid = []
+# Antithesis SDK + coverage runtime; build with the sancov rustflags (see antithesis/broker/Dockerfile)
+antithesis = ["dep:antithesis_sdk", "dep:antithesis-instrumentation"]
 
 [dev-dependencies]
 pretty_env_logger = "0.5.0"

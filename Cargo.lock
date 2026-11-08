@@ -109,9 +109,19 @@ name = "antithesis-client"
 version = "0.1.0"
 dependencies = [
  "antithesis_sdk",
+ "crc32fast",
  "rumqttc",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "antithesis-instrumentation"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "009bd9354d773dea6b85c08fa0d929ff6c52003cbe3cf496614eff79d2895eb5"
+dependencies = [
+ "cc",
 ]
 
 [[package]]
@@ -663,6 +673,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "59ed5838eebb26a2bb2e58f6d5b5316989ae9d08bab10e0e6d103e656d1b0280"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "crc32fast"
+version = "1.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ba106e844045ddc02c20768ac4b0b7cb45f2cc2ecbd833ac9f5dacb183c2055"
+dependencies = [
+ "cfg-if",
 ]
 
 [[package]]
@@ -2293,6 +2312,8 @@ dependencies = [
 name = "rumqttd"
 version = "0.20.0"
 dependencies = [
+ "antithesis-instrumentation",
+ "antithesis_sdk",
  "async-tungstenite 0.25.1",
  "axum",
  "bytes",

@@ -4,6 +4,10 @@ use rumqttd::Broker;
 use clap::Parser;
 use tracing::trace;
 
+// Keeps the coverage runtime shim from being dropped as unused at link time.
+#[cfg(all(target_os = "linux", feature = "antithesis"))]
+use antithesis_instrumentation as _;
+
 static RUMQTTD_DEFAULT_CONFIG: &str = include_str!("../rumqttd.toml");
 
 #[derive(Parser)]
@@ -32,6 +36,9 @@ enum Command {
 }
 
 fn main() {
+    #[cfg(feature = "antithesis")]
+    antithesis_sdk::antithesis_init();
+
     let commandline: CommandLine = CommandLine::parse();
 
     if let Some(Command::GenerateConfig) = commandline.command {
@@ -85,6 +92,12 @@ fn main() {
     validate_config(&configs);
 
     // println!("{:#?}", configs);
+
+    #[cfg(feature = "antithesis")]
+    antithesis_sdk::assert_reachable!(
+        "rumqttd started with a valid config",
+        &serde_json::json!({})
+    );
 
     let mut broker = Broker::new(configs);
     broker.start().unwrap();
